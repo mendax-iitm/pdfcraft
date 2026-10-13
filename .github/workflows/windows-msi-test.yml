@@ -1,0 +1,28 @@
+# Test build only (not part of the feature PR): builds an unsigned x64 MSI and uploads it.
+name: Windows MSI (test build)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/windows-msi]
+
+jobs:
+  msi:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install WiX v5
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Build MSI
+        shell: pwsh
+        run: pwsh packaging/windows/package.ps1 -Arch x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdfcraft-windows-x64
+          path: |
+            dist/release/*.msi
+            dist/release/*.zip
