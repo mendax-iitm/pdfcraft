@@ -483,22 +483,7 @@ pub fn place(page: usize, info: &PageInfo, at: [f64; 2], sig: &SavedSig, initial
     }
 }
 
-/// `p` on page `from` moved to the same place on page `to`, relative to their crop boxes.
-pub(crate) fn same_place(from: &PageInfo, to: &PageInfo, p: [f64; 2]) -> [f64; 2] {
-    [0, 1].map(|i| {
-        // Constant indices into the fixed-size crop boxes: always in bounds.
-        let (f0, f1, t0, t1) = (f64::from(from.crop[i]), f64::from(from.crop[i + 2]), f64::from(to.crop[i]), f64::from(to.crop[i + 2]));
-        let w = f1 - f0;
-        if w.abs() < 1e-3 || !p[i].is_finite() { t0 } else { t0 + (p[i] - f0) / w * (t1 - t0) }
-    })
-}
-
-/// `r` on page `from` moved, same size, so its centre is in the same place on page `to`.
-pub(crate) fn same_rect(from: &PageInfo, to: &PageInfo, r: [f64; 4]) -> [f64; 4] {
-    let c = same_place(from, to, [(r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0]);
-    let (hw, hh) = ((r[2] - r[0]) / 2.0, (r[3] - r[1]) / 2.0);
-    [c[0] - hw, c[1] - hh, c[0] + hw, c[1] + hh]
-}
+pub(crate) use pdfcraft_engine::{same_place, same_rect};
 
 /// The saved signature or initials placed at `at` on `page`, placed again in the same place on
 /// each of `pages` (`page` itself skipped), as one undo step.

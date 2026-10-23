@@ -850,6 +850,8 @@ impl PdfCraftApp {
                 {
                     let view = &mut self.views[i];
                     view.document_changed(&d.info);
+                    // The placement Fill & Sign would repeat may be gone with the edits.
+                    view.last_fill_sig = None;
                     // Revert discards this source's uncommitted typing as well as model edits.
                     // Otherwise a later Save could write a rejected draft back into the file.
                     view.forms.focus = None;
@@ -1532,6 +1534,10 @@ mod tests {
         assert!(app.views[0].last_fill_sig.is_some(), "placing it (a comment edit) keeps it");
         assert!(app.apply_edit(pdfcraft_engine::Edit::InsertBlankPage { at: 0, width: 200.0, height: 300.0 }));
         assert!(app.views[0].last_fill_sig.is_none(), "page 0 is another page now");
+        // Revert takes the placement with the unsaved edits.
+        app.views[0].last_fill_sig = Some((0, [50.0, 50.0], false, sig));
+        app.revert_active();
+        assert!(app.views[0].last_fill_sig.is_none(), "revert clears it");
     }
 }
 

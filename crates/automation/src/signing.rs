@@ -223,17 +223,17 @@ impl Automation {
             (None | Some(Value::Null), _) => Vec::new(),
             (Some(_), _) if field.is_some() => return Err(bad("also_pages needs a new signature: pass rect, not field")),
             (Some(_), None) => return Err(bad("also_pages needs a visible signature: pass rect")),
-            (Some(_), Some(r)) => {
-                let from = &doc.info.pages[page];
+            (Some(_), Some(_)) => {
+                // `rect` is the validated user-space rectangle on the signed page; the signed
+                // page's size is kept, and its centre is placed alike relative to each crop box.
+                let (Some(from), Some(r)) = (doc.info.pages.get(page), rect) else {
+                    return Err(bad("the document has no page to put the signature on"));
+                };
                 let mut also = Vec::new();
                 for p in self.pages(a, "also_pages")? {
-                    let Some(to) = doc.info.pages.get(p) else { continue };
-                    let (sx, sy) = (to.width / from.width.max(1e-3), to.height / from.height.max(1e-3));
-                    let (u0, u1) = (to.view_to_user(r[0] as f32 * sx, r[1] as f32 * sy), to.view_to_user(r[2] as f32 * sx, r[3] as f32 * sy));
-                    // Keep the signed page's size; only the place follows the page.
-                    let (cx, cy) = ((f64::from(u0[0]) + f64::from(u1[0])) / 2.0, (f64::from(u0[1]) + f64::from(u1[1])) / 2.0);
-                    let (hw, hh) = rect.map_or((0.0, 0.0), |u| ((u[2] - u[0]) / 2.0, (u[3] - u[1]) / 2.0));
-                    also.push((p, [cx - hw, cy - hh, cx + hw, cy + hh]));
+                    if let Some(to) = doc.info.pages.get(p) {
+                        also.push((p, pdfcraft_engine::same_rect(from, to, r)));
+                    }
                 }
                 also
             }
