@@ -587,7 +587,10 @@ pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &Dig
             .and_then(|(_, w)| nums(doc, w, b"Rect"))
             .filter(|r| r.len() == 4)
             .map(|r| [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]);
-        let visible = rect.is_some_and(|r| r[2] - r[0] > 0.5 && r[3] - r[1] > 0.5);
+        // Shown when it has a box, and its widget isn't Hidden (2) or NoView (32), as the forms
+        // crate reads a widget's flags.
+        let flags = widget.and_then(|(_, w)| w.get(b"F")).and_then(|o| doc.resolve(o).as_int()).unwrap_or(0);
+        let visible = rect.is_some_and(|r| r[2] - r[0] > 0.5 && r[3] - r[1] > 0.5) && flags & (2 | 32) == 0;
         let v = f.signature(doc);
         let mut info = SignatureInfo {
             field: f.name.clone(),
@@ -667,6 +670,17 @@ pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &Dig
 
 fn page_index(doc: &Document, p: ObjRef) -> Option<usize> {
     pdfcraft_annot::page_refs(doc).ok()?.iter().position(|r| *r == p)
+}
+
+/// A widget's `/MK /R` as a quarter turn (0, 90, 180 or 270); missing, malformed or not a
+/// multiple of 90 counts as 0, as `pdfcraft-forms` reads it for the fields it draws.
+fn mk_rotation(doc: &Document, widget: &Dict) -> i64 {
+    let r = widget
+        .get(b"MK")
+        .map(|mk| doc.resolve(mk))
+        .and_then(|mk| mk.as_dict().and_then(|mk| mk.get(b"R")).map(|r| doc.resolve(r)))
+        .and_then(|r| r.as_int().or_else(|| r.as_f64().filter(|v| v.is_finite() && v.abs() <= 1.0e6).map(|v| v.round() as i64)));
+    r.map(|r| r.rem_euclid(360)).filter(|q| matches!(q, 90 | 180 | 270)).unwrap_or(0)
 }
 
 /// Validate one signature dictionary.
@@ -1464,6 +1478,23 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
             list.push(what);
         }
     }
+    // An object the signed revision had and this one frees is a change too, and the loop above
+    // only sees objects that still exist. File plumbing (cross-reference and object streams) is
+    // rewritten by every save and is not a change.
+    let current: HashSet<u32> = doc.object_numbers().into_iter().collect();
+    for num in old.object_numbers().into_iter().filter(|n| !current.contains(n)) {
+        let r = ObjRef { num, generation: old.generation(num) };
+        let was = old.get(r);
+        let signed_role = old_content.contains(&r) || signed_pages.contains(&r) || signed_resources.contains_key(&r);
+        // A signed page's content or resource is judged by that role, whatever /Type its stream carried.
+        if !signed_role && matches!(&*was, Object::Stream(s) if matches!(s.dict.name(b"Type"), Some(b"XRef" | b"ObjStm"))) {
+            continue;
+        }
+        let what = if signed_role { kind::PAGE_CONTENT } else { kind::OTHER };
+        if !disallowed.contains(&what) {
+            disallowed.push(what);
+        }
+    }
     if disallowed.is_empty() { Modification::Allowed(allowed) } else { Modification::Disallowed(disallowed) }
 }
 
@@ -1785,6 +1816,15 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) 
     // A later revision cannot make an existing object a signature by relabelling it: a signature
     // change is only a brand-new object, or one that was already a signature object when signed.
     let signature_ok = before.is_none_or(is_signature_dict);
+    // A signature widget that already held a signature is what the signature shows: moving it or
+    // swapping its appearance can hide the signed page under it. Judged by the signed revision,
+    // so relabelling the widget now does not change that.
+    if before.is_some_and(|b| {
+        b.name(b"Subtype") == Some(b"Widget") && b.name(b"FT") == Some(b"Sig") && b.get(b"V").is_some_and(|v| old.resolve(v).as_dict().is_some())
+    }) && before != Some(d)
+    {
+        return kind::PAGE_CONTENT;
+    }
     match ty {
         // Only a new signature value or policy: rewriting a signed one is not a signature (#1788).
         Some(b"Sig" | b"DocTimeStamp" | b"SigRef" | b"TransformParams") if before.is_none() => return kind::SIGNATURE,
@@ -2048,6 +2088,8 @@ fn sign_inner(
         .field
         .as_deref()
         .map(|n| sig_fields(&doc).into_iter().find(|f| f.name == n).ok_or_else(|| SignError::Pdf(format!("there is no signature field {n:?}"))));
+    // Each widget with `turn`: how far its appearance is turned to read upright (`/MK /R`,
+    // counterclockwise).
     let (widgets, rect) = match existing {
         Some(f) => {
             let f = f?;
@@ -2064,7 +2106,9 @@ fn sign_inner(
             doc.update_dict(fr, |d| d.set(b"V".to_vec(), Object::Ref(sig)))?;
             let (wr, wd) = f.widgets.first().cloned().ok_or_else(|| SignError::Pdf("the field has no widget".into()))?;
             let rect = nums(&doc, &wd, b"Rect").filter(|r| r.len() == 4).map(|r| [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]);
-            (vec![wr.unwrap_or(fr)], rect.unwrap_or([0.0; 4]))
+            // The field's own rotation, as a form author set it: an existing field is not
+            // reoriented, so one without `/MK /R` is drawn as before.
+            (vec![(wr.unwrap_or(fr), mk_rotation(&doc, &wd))], rect.unwrap_or([0.0; 4]))
         }
         None => {
             let page = *pages.get(opts.page).ok_or_else(|| SignError::Pdf(format!("page {} does not exist", opts.page + 1)))?;
@@ -2075,8 +2119,12 @@ fn sign_inner(
                 .unwrap_or_else(|| (1..).map(|i| format!("Signature{i}")).find(|n| !taken.contains(n)).unwrap_or_default());
             let rect = opts.rect.unwrap_or([0.0; 4]);
             // The other pages the signature shows on (each page once, never the signed one).
+            // On a page shown turned, the signature reads upright as the page is displayed: each
+            // widget is turned back by its page's rotation (ISO 32000-2 §12.5.6.19, `/MK /R`).
+            let turns: Vec<i64> = pdfcraft_model::pages(&doc).iter().map(|p| p.rotation(&doc)).collect();
+            let turn = |p: usize| turns.get(p).copied().unwrap_or(0);
             let mut seen = HashSet::from([opts.page]);
-            let mut placed = vec![(page, rect)];
+            let mut placed = vec![(page, rect, turn(opts.page))];
             for &(p, r) in &opts.also {
                 if !seen.insert(p) {
                     continue;
@@ -2085,9 +2133,9 @@ fn sign_inner(
                     return Err(SignError::Pdf("only a visible signature can be shown on other pages".into()));
                 }
                 let pr = *pages.get(p).ok_or_else(|| SignError::Pdf(format!("page {} does not exist", p.saturating_add(1))))?;
-                placed.push((pr, r));
+                placed.push((pr, r, turn(p)));
             }
-            let widget_dict = |page: ObjRef, rect: [f64; 4]| {
+            let widget_dict = |page: ObjRef, rect: [f64; 4], turn: i64| {
                 let mut w = Dict::new();
                 w.set(b"Type".to_vec(), Object::name("Annot"));
                 w.set(b"Subtype".to_vec(), Object::name("Widget"));
@@ -2095,6 +2143,11 @@ fn sign_inner(
                 w.set(b"P".to_vec(), Object::Ref(page));
                 // Print + Locked.
                 w.set(b"F".to_vec(), Object::Int(4 | 128));
+                if turn != 0 {
+                    let mut mk = Dict::new();
+                    mk.set(b"R".to_vec(), Object::Int(turn));
+                    w.set(b"MK".to_vec(), Object::Dict(mk));
+                }
                 w
             };
             let mut field = Dict::new();
@@ -2103,26 +2156,27 @@ fn sign_inner(
             field.set(b"V".to_vec(), Object::Ref(sig));
             let (field_ref, widgets) = if placed.len() == 1 {
                 // One page: the field and its widget are one dictionary, as Acrobat writes it.
-                let mut w = widget_dict(page, rect);
+                let t = turn(opts.page);
+                let mut w = widget_dict(page, rect, t);
                 for (k, v) in field.iter() {
                     w.set(k.clone(), v.clone());
                 }
                 let wr = doc.add(Object::Dict(w));
-                (wr, vec![(page, wr)])
+                (wr, vec![(page, wr, t)])
             } else {
                 // Several pages: one field whose widgets (its /Kids) share the signature.
                 let fr = doc.add(Object::Dict(field.clone()));
                 let mut widgets = Vec::with_capacity(placed.len());
-                for &(p, r) in &placed {
-                    let mut w = widget_dict(p, r);
+                for &(p, r, t) in &placed {
+                    let mut w = widget_dict(p, r, t);
                     w.set(b"Parent".to_vec(), Object::Ref(fr));
-                    widgets.push((p, doc.add(Object::Dict(w))));
+                    widgets.push((p, doc.add(Object::Dict(w)), t));
                 }
-                field.set(b"Kids".to_vec(), Object::Array(widgets.iter().map(|(_, w)| Object::Ref(*w)).collect()));
+                field.set(b"Kids".to_vec(), Object::Array(widgets.iter().map(|(_, w, _)| Object::Ref(*w)).collect()));
                 doc.set(fr, Object::Dict(field));
                 (fr, widgets)
             };
-            for &(page, wr) in &widgets {
+            for &(page, wr, _) in &widgets {
                 // Page /Annots (indirect arrays are updated in place).
                 let pd = doc.get(page).as_dict().cloned().unwrap_or_default();
                 match pd.get(b"Annots") {
@@ -2158,7 +2212,7 @@ fn sign_inner(
                 // Inline (or new) AcroForms stay in the catalog.
                 None => doc.update_dict(root, |c| c.set(b"AcroForm".to_vec(), Object::Dict(af)))?,
             }
-            (widgets.into_iter().map(|(_, w)| w).collect::<Vec<_>>(), rect)
+            (widgets.into_iter().map(|(_, w, t)| (w, t)).collect::<Vec<_>>(), rect)
         }
     };
     if opts.field.is_some() {
@@ -2171,14 +2225,22 @@ fn sign_inner(
             doc.update_dict(r, |af| af.set(b"SigFlags".to_vec(), Object::Int(3)))?;
         }
     }
-    // The appearance.
-    let ap = appearance(&mut doc, rect, &name, &id.certificate, opts)?;
-    let ap_ref = doc.add(Object::Stream(ap));
-    let mut apd = Dict::new();
-    apd.set(b"N".to_vec(), Object::Ref(ap_ref));
-    // Every widget shows the same appearance (scaled to its /Rect when sizes differ).
-    for w in widgets {
-        doc.update_dict(w, |d| d.set(b"AP".to_vec(), Object::Dict(apd.clone())))?;
+    // The appearance: one for each rotation, shared by the widgets turned alike (scaled to each
+    // /Rect when sizes differ).
+    let mut drawn: Vec<(i64, ObjRef)> = Vec::new();
+    for (w, turn) in widgets {
+        let ap_ref = match drawn.iter().find(|(t, _)| *t == turn) {
+            Some(&(_, r)) => r,
+            None => {
+                let ap = appearance(&mut doc, rect, turn, &name, &id.certificate, opts)?;
+                let r = doc.add(Object::Stream(ap));
+                drawn.push((turn, r));
+                r
+            }
+        };
+        let mut apd = Dict::new();
+        apd.set(b"N".to_vec(), Object::Ref(ap_ref));
+        doc.update_dict(w, |d| d.set(b"AP".to_vec(), Object::Dict(apd)))?;
     }
     // Write with the placeholders, then patch them.
     let save = SaveOptions { mod_date: Some(opts.date.clone()), object_streams: false, ..SaveOptions::default() };
@@ -2303,9 +2365,15 @@ pub fn display_date(pdf: &str) -> String {
 /// draw: signing invisibly, or leaving that part out, still works. A graphic doesn't change this:
 /// the name it replaces on the left is still among the details. A label that is drawn
 /// ([`AppearanceLabels`], the caller's words) must be drawable in Helvetica, and is refused otherwise.
-fn appearance(doc: &mut Document, rect: [f64; 4], name: &str, cert: &Certificate, opts: &SignOptions) -> Result<Stream, SignError> {
+///
+/// `turn` is the widget's `/MK /R` (0, 90, 180 or 270; anything else counts as 0): the layout is
+/// drawn upright in the box as turned by it, and a `/Matrix` maps that box onto `rect`.
+fn appearance(doc: &mut Document, rect: [f64; 4], turn: i64, name: &str, cert: &Certificate, opts: &SignOptions) -> Result<Stream, SignError> {
     use pdfcraft_fonts::{first_undrawable, helvetica_width, inter_width, literal, undrawable_message, win_ansi, wrap, wrap_with};
-    let (w, h) = ((rect[2] - rect[0]).max(0.0), (rect[3] - rect[1]).max(0.0));
+    let turn = if matches!(turn, 90 | 180 | 270) { turn } else { 0 };
+    let (rw, rh) = ((rect[2] - rect[0]).max(0.0), (rect[3] - rect[1]).max(0.0));
+    // The upright layout box: a quarter turn swaps its sides.
+    let (w, h) = if turn % 180 == 0 { (rw, rh) } else { (rh, rw) };
     let a = &opts.appearance;
     let dn = cert.subject.display();
     let mut needs_unicode = false;
@@ -2451,6 +2519,16 @@ fn appearance(doc: &mut Document, rect: [f64; 4], name: &str, cert: &Certificate
     d.set(b"Type".to_vec(), Object::name("XObject"));
     d.set(b"Subtype".to_vec(), Object::name("Form"));
     d.set(b"BBox".to_vec(), Object::Array([0.0, 0.0, w, h].iter().map(|x| Object::Real(*x)).collect()));
+    if turn != 0 {
+        // Viewers fit the box, transformed by `/Matrix`, to the widget's `/Rect` (ISO 32000-2
+        // §12.5.5); this one lands on `rect` exactly, turned as `/MK /R` says.
+        let mut m = pdfcraft_model::view_matrix_for(turn, [rect[0], rect[1], rect[0] + rw, rect[1] + rh]);
+        if !m.iter().all(|x| x.is_finite()) {
+            // A caller's non-finite corner: the turn alone, which viewers fit to `/Rect` the same.
+            m = pdfcraft_model::view_matrix_for(turn, [0.0; 4]);
+        }
+        d.set(b"Matrix".to_vec(), Object::Array(m.iter().map(|x| Object::Real(*x)).collect()));
+    }
     let mut res = Dict::new();
     res.set(b"Font".to_vec(), Object::Dict(fonts));
     if let Some(im) = image {
