@@ -815,10 +815,15 @@ fn choose(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> bool {
         app.remove_digital_id(i);
     }
     if refresh {
+        // Keep the chosen ID (by path: the OS key store entries are listed again); the first
+        // usable one only if it has gone.
+        let chosen = app.sign_draft.as_ref().and_then(|d| d.selected).and_then(|i| app.digital_ids.get(i)).map(|e| e.path.clone());
         app.refresh_os_key_store_ids();
         let ids = &app.digital_ids;
         if let Some(d) = app.sign_draft.as_mut() {
-            d.selected = ids.iter().position(|e| e.unusable.is_none());
+            d.selected = chosen
+                .and_then(|path| ids.iter().position(|e| e.path == path && e.unusable.is_none()))
+                .or_else(|| ids.iter().position(|e| e.unusable.is_none()));
             d.confirm_remove = None;
         }
     }

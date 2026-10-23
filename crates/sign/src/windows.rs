@@ -93,13 +93,22 @@ fn issuers(context: &CertContext, certificate: &Certificate) -> Vec<Certificate>
 
 /// The root certificates Windows trusts (Current User > Trusted Root Certification Authorities,
 /// which shows the machine's roots too), as anchors for validating signatures. The CA a USB
-/// token's driver installs is among them. Certificates that can't be read are left out.
+/// token's driver installs is among them. Certificates that can't be read, and those Windows
+/// explicitly distrusts (Untrusted Certificates), are left out.
 pub fn trusted_roots() -> Result<Vec<Certificate>, SignError> {
-    let store = CertStore::open(CertStoreType::CurrentUser, "Root")
-        .map_err(|e| SignError::Crypto(format!("the Windows Trusted Root store couldn't be opened: {}", describe(&e))))?;
-    let contexts =
-        store.find_all().map_err(|e| SignError::Crypto(format!("the Windows certificate store couldn't be searched: {}", describe(&e))))?;
-    Ok(contexts.iter().filter_map(|c| Certificate::parse(c.as_der()).ok()).collect())
+    let open = |name: &str, what: &str| {
+        CertStore::open(CertStoreType::CurrentUser, name)
+            .map_err(|e| SignError::Crypto(format!("the Windows {what} store couldn't be opened: {}", describe(&e))))?
+            .find_all()
+            .map_err(|e| SignError::Crypto(format!("the Windows certificate store couldn't be searched: {}", describe(&e))))
+    };
+    // ponytail: exact-DER match against Disallowed; Windows chain policy (CertGetCertificateChain) if revocation or partial-chain distrust matters.
+    let distrusted: Vec<Vec<u8>> = open("Disallowed", "Untrusted Certificates")?.iter().map(|c| c.as_der().to_vec()).collect();
+    Ok(open("Root", "Trusted Root")?
+        .iter()
+        .filter(|c| !distrusted.iter().any(|d| d.as_slice() == c.as_der()))
+        .filter_map(|c| Certificate::parse(c.as_der()).ok())
+        .collect())
 }
 
 /// List usable RSA, P-256 and P-384 CNG identities in Current User > Personal

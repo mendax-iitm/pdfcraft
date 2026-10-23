@@ -615,7 +615,7 @@ pub(crate) fn signature_entries(ui: &mut egui::Ui, app: &mut crate::PdfCraftApp,
 /// same place, on a range of pages. True once repeated.
 pub(crate) fn repeat_entry(ui: &mut egui::Ui, app: &mut crate::PdfCraftApp) -> bool {
     let Some((i, doc_id)) = app.active_ids() else { return false };
-    let Some((page, at, initials)) = app.views.get(i).and_then(|v| v.last_fill_sig) else { return false };
+    let Some(&(page, at, initials, _)) = app.views.get(i).and_then(|v| v.last_fill_sig.as_ref()) else { return false };
     let count = app.session.get(doc_id).map_or(0, |d| d.info.pages.len());
     if count < 2 {
         return false;
@@ -627,10 +627,6 @@ pub(crate) fn repeat_entry(ui: &mut egui::Ui, app: &mut crate::PdfCraftApp) -> b
         crate::widgets::radio_value(ui, &mut r.all, true, tl!("All pages"));
         crate::widgets::radio_value(ui, &mut r.all, false, tl!("Pages from"));
     });
-    // Like `PageRange::ui`: an untouched range opens as the whole document.
-    if r.from == 1 && r.to == 1 {
-        r.to = count;
-    }
     ui.add_enabled_ui(!r.all, |ui| {
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut r.from).range(1..=count));
@@ -642,9 +638,10 @@ pub(crate) fn repeat_entry(ui: &mut egui::Ui, app: &mut crate::PdfCraftApp) -> b
         return false;
     }
     let pages = app.fill_repeat.pages(count);
-    let sig = if initials { app.initials.clone() } else { app.signature.clone() };
-    let author = app.comment_prefs.author.clone();
-    let edit = sig.zip(app.session.get(doc_id)).and_then(|(sig, d)| repeat_on_pages(&d.info, page, at, &sig, initials, &pages, &author));
+    // The graphic that was placed, even if the saved one has changed since.
+    let sig = app.views.get(i).and_then(|v| v.last_fill_sig.as_ref()).map(|(.., sig)| sig);
+    let author = &app.comment_prefs.author;
+    let edit = sig.zip(app.session.get(doc_id)).and_then(|(sig, d)| repeat_on_pages(&d.info, page, at, sig, initials, &pages, author));
     match edit {
         Some(edit) => {
             app.apply_edit(edit);
@@ -753,14 +750,14 @@ pub(crate) fn page_input(
         }),
         FillTool::Signature => match signature {
             Some(s) => {
-                view.last_fill_sig = Some((page, at, false));
+                view.last_fill_sig = Some((page, at, false, s.clone()));
                 place(page, p, at, s, false, author).map(|e| FillAction::Signature(Box::new(e)))
             }
             None => Some(FillAction::CreateSignature),
         },
         FillTool::Initials => match initials {
             Some(s) => {
-                view.last_fill_sig = Some((page, at, true));
+                view.last_fill_sig = Some((page, at, true, s.clone()));
                 place(page, p, at, s, true, author).map(|e| FillAction::Signature(Box::new(e)))
             }
             None => Some(FillAction::CreateInitials),
