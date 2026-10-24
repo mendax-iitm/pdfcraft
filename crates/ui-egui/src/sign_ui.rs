@@ -297,7 +297,14 @@ impl PdfCraftApp {
     pub fn trust_os_roots(&mut self) {
         #[cfg(target_os = "windows")]
         match sign::windows::trusted_roots() {
-            Ok(roots) => self.session.set_system_trust(roots),
+            Ok(roots) => {
+                // Revalidation rebuilds each document's display copy, so the views redraw too
+                // (as in apply_trusted_certificates).
+                self.session.set_system_trust(roots);
+                for view in &mut self.views {
+                    view.invalidate_content();
+                }
+            }
             Err(e) => self.notify_fmt("The Windows trusted root certificates couldn't be read: {e}", &[("e", &e.to_string())]),
         }
     }
