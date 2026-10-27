@@ -696,7 +696,7 @@ trailer << /Root 1 0 R >>
     if let Ok(dir) = std::env::var("PDFCRAFT_SIGNING_SHOTS") {
         h.render().unwrap().save(std::path::Path::new(&dir).join("sign-on-pages.png")).unwrap();
     }
-    h.get_by_label("Sign").click();
+    support::outside_menus(&h, "Sign").click();
     h.run_steps(6);
     let s = h.state();
     assert_eq!(s.sign_draft.as_ref().and_then(|d| d.error.clone()), None);
